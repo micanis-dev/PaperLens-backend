@@ -1,0 +1,407 @@
+openapi: 3.1.0
+info:
+  title: PaperLens API
+  version: 1.0.0
+  description: Server boundary for managed translation, accounts, plans and credits.
+servers:
+  - url: https://api.paperlens.micanis.dev
+  - url: http://127.0.0.1:8080
+security:
+  - sessionCookie: []
+paths:
+  /v1/healthz:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Process health
+  /v1/internal/metrics:
+    get:
+      summary: Prometheus metrics for authenticated administrators
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '403': { $ref: '#/components/responses/ApiError' }
+  /v1/plans:
+    get:
+      security: []
+      responses:
+        '200':
+          description: Plan catalog
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requestId: { type: string }
+                  plans:
+                    type: array
+                    items: { $ref: '#/components/schemas/Plan' }
+  /v1/auth/logout:
+    post:
+      responses:
+        '200':
+          description: Session invalidated and cookie cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requestId, loggedOut]
+                properties:
+                  requestId: { type: string }
+                  loggedOut: { type: boolean }
+  /v1/auth/google:
+    get:
+      security: []
+      responses:
+        '302': { description: Redirect to Google OAuth }
+  /v1/auth/google/callback:
+    get:
+      security: []
+      parameters:
+        - { name: state, in: query, required: true, schema: { type: string } }
+        - { name: code, in: query, required: true, schema: { type: string } }
+      responses:
+        '302': { description: Set session cookie and redirect to frontend }
+        '400': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/magic-link:
+    post:
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email, maxLength: 320 }
+      responses:
+        '200': { description: Magic-link delivery accepted }
+        '429': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/magic-link/verify:
+    get:
+      security: []
+      parameters:
+        - { name: token, in: query, required: true, schema: { type: string } }
+      responses:
+        '302': { description: Set session cookie and redirect to frontend }
+        '400': { $ref: '#/components/responses/ApiError' }
+  /v1/account:
+    get:
+      responses:
+        '200': { description: Current account and optional deletion schedule }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/account/deletion:
+    post:
+      summary: Schedule account deletion after a 24-hour grace period
+      responses:
+        '200': { description: Deletion schedule }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '403': { $ref: '#/components/responses/ApiError' }
+        '503': { $ref: '#/components/responses/ApiError' }
+  /v1/account/deletion/cancel:
+    post:
+      summary: Cancel a scheduled account deletion during the grace period
+      responses:
+        '200': { description: Deletion canceled }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '404': { $ref: '#/components/responses/ApiError' }
+  /v1/billing:
+    get:
+      responses:
+        '200': { description: Current billing configuration and subscription state }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/checkout:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planId]
+              properties:
+                planId: { type: string, enum: [plus, pro, ultra] }
+      responses:
+        '200': { description: Stripe Checkout session }
+        '400': { $ref: '#/components/responses/ApiError' }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '503': { $ref: '#/components/responses/ApiError' }
+  /v1/portal:
+    post:
+      responses:
+        '200': { description: Stripe Customer Portal URL }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '404': { $ref: '#/components/responses/ApiError' }
+  /v1/billing/change-plan:
+    post:
+      summary: Change an existing subscription plan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planId]
+              properties:
+                planId: { type: string, enum: [free, plus, pro, ultra] }
+      responses:
+        '200': { description: Plan change accepted }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '409': { $ref: '#/components/responses/ApiError' }
+        '503': { $ref: '#/components/responses/ApiError' }
+  /v1/stripe/webhook:
+    post:
+      security: []
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { type: object } }
+      responses:
+        '200': { description: Webhook accepted }
+        '400': { $ref: '#/components/responses/ApiError' }
+        '503': { $ref: '#/components/responses/ApiError' }
+  /v1/credits:
+    get:
+      responses:
+        '200': { description: Credit balance }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/usage:
+    get:
+      responses:
+        '200': { description: Usage summary }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/admin/rates:
+    get:
+      summary: Read the published model cost and credit conversion policy
+      responses:
+        '200':
+          description: Published rate policy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RatePolicyEnvelope' }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '403': { $ref: '#/components/responses/ApiError' }
+    put:
+      summary: Publish a new version of the model cost and credit conversion policy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RatePolicy' }
+      responses:
+        '200':
+          description: Policy published for future requests
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RatePolicyEnvelope' }
+        '400': { $ref: '#/components/responses/ApiError' }
+        '401': { $ref: '#/components/responses/ApiError' }
+        '403': { $ref: '#/components/responses/ApiError' }
+        '503': { $ref: '#/components/responses/ApiError' }
+  /v1/translations/estimate:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TranslationRequest' }
+      responses:
+        '200': { description: Estimate }
+        '400': { $ref: '#/components/responses/ApiError' }
+  /v1/translations:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TranslationRequest' }
+      responses:
+        '200':
+          description: Translation resource
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TranslationEnvelope' }
+        '409': { $ref: '#/components/responses/ApiError' }
+        '413': { $ref: '#/components/responses/ApiError' }
+        '429': { $ref: '#/components/responses/ApiError' }
+        '502': { $ref: '#/components/responses/ApiError' }
+      description: >-
+        Returns JSON by default. When Accept is text/event-stream, returns SSE
+        events in the order started, segment, usage, completed or failed.
+  /v1/translations/{id}:
+    get:
+      parameters:
+        - $ref: '#/components/parameters/TranslationID'
+      responses:
+        '200':
+          description: Translation resource
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TranslationEnvelope' }
+        '404': { $ref: '#/components/responses/ApiError' }
+  /v1/translations/{id}/cancel:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/TranslationID'
+      responses:
+        '200':
+          description: Canceled translation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TranslationEnvelope' }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: paperlens_session
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 36, maxLength: 128 }
+    TranslationID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    ApiError:
+      description: Common API error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+  schemas:
+    TranslationEnvelope:
+      type: object
+      required: [requestId, translation]
+      properties:
+        requestId: { type: string }
+        translation:
+          type: object
+          required: [id, mode, model, status, createdAt]
+          properties:
+            id: { type: string }
+            mode: { type: string }
+            model: { type: string }
+            rateVersion: { type: string }
+            status: { type: string }
+            errorCode: { type: string }
+            createdAt: { type: string, format: date-time }
+            completedAt: { type: string, format: date-time }
+            result: { $ref: '#/components/schemas/TranslationResult' }
+    AccountDeletion:
+      type: object
+      required: [requestedAt, executeAt]
+      properties:
+        requestedAt: { type: string, format: date-time }
+        executeAt: { type: string, format: date-time }
+    TranslationRequest:
+      type: object
+      required: [documentId, sourceLanguage, targetLanguage, segments, preserveFormatting]
+      properties:
+        documentId: { type: string }
+        sourceLanguage: { type: string, example: auto }
+        targetLanguage: { type: string, example: ja }
+        preserveFormatting: { type: boolean }
+        segments:
+          type: array
+          items:
+            type: object
+            required: [id, pageNumber, order, text, textHash]
+            properties:
+              id: { type: string }
+              pageNumber: { type: integer, minimum: 1 }
+              order: { type: integer, minimum: 0 }
+              text: { type: string }
+              textHash: { type: string }
+    TranslationResult:
+      type: object
+      required: [requestId, segments, usage, provider, warnings]
+      properties:
+        requestId: { type: string }
+        segments:
+          type: array
+          items:
+            type: object
+            required: [id, pageNumber, translatedText, sourceTextHash]
+            properties:
+              id: { type: string }
+              pageNumber: { type: integer, minimum: 1 }
+              sequence: { type: integer, minimum: 1 }
+              translatedText: { type: string }
+              sourceTextHash: { type: string }
+        usage:
+          type: object
+          required: [creditsUsed]
+          properties:
+            inputTokens: { type: integer, minimum: 0 }
+            outputTokens: { type: integer, minimum: 0 }
+            creditsUsed: { type: integer, minimum: 0 }
+        provider:
+          type: object
+          required: [mode, name, model]
+          properties:
+            mode: { type: string }
+            name: { type: string }
+            model: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+    ApiError:
+      type: object
+      required: [code, message, requestId, retryable]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        requestId: { type: string }
+        retryable: { type: boolean }
+    Plan:
+      type: object
+      required: [id, monthlyPriceYen, priceVersion, monthlyCredits, dailyCredits, perRequestLimit, concurrentLimit, priority]
+      properties:
+        id: { type: string }
+        monthlyPriceYen: { type: integer, minimum: 0 }
+        priceVersion: { type: string }
+        monthlyCredits: { type: integer, minimum: 0 }
+        dailyCredits: { type: integer, minimum: 0 }
+        perRequestLimit: { type: integer, minimum: 0 }
+        concurrentLimit: { type: integer, minimum: 1 }
+        priority: { type: string }
+    RatePolicyEnvelope:
+      type: object
+      required: [requestId, ratePolicy]
+      properties:
+        requestId: { type: string }
+        ratePolicy: { $ref: '#/components/schemas/RatePolicy' }
+    RatePolicy:
+      type: object
+      required: [version, inputTokensPerCredit, outputTokensPerCredit, outputWeight, models]
+      properties:
+        version: { type: string, minLength: 1, maxLength: 64 }
+        inputTokensPerCredit: { type: integer, minimum: 1 }
+        outputTokensPerCredit: { type: integer, minimum: 1 }
+        outputWeight: { type: integer, minimum: 1 }
+        models:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: object
+            required: [inputMicroUsdPerMillion, outputMicroUsdPerMillion]
+            properties:
+              inputMicroUsdPerMillion: { type: integer, minimum: 0 }
+              outputMicroUsdPerMillion: { type: integer, minimum: 0 }

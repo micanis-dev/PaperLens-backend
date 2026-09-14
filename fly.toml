@@ -1,0 +1,37 @@
+app = "paperlens-api"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  APP_ENV = "production"
+  APP_BASE_URL = "https://api.paperlens.micanis.dev"
+  HTTP_ADDR = "0.0.0.0:8080"
+  FRONTEND_ORIGINS = "https://paperlens.micanis.dev"
+  FRONTEND_BASE_URL = "https://paperlens.micanis.dev"
+  MAGIC_LINK_BASE_URL = "https://api.paperlens.micanis.dev/v1/auth/magic-link/verify"
+  STRIPE_SUCCESS_URL = "https://paperlens.micanis.dev/billing/?billing=success"
+  STRIPE_CANCEL_URL = "https://paperlens.micanis.dev/billing/?billing=cancel"
+  STRIPE_PORTAL_RETURN_URL = "https://paperlens.micanis.dev/billing/"
+  SESSION_COOKIE_NAME = "paperlens_session"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/v1/healthz"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
