@@ -2,6 +2,8 @@
 
 仕様書の「Fly.io 東京リージョンのGo API / Supabase FreeのPostgreSQL」境界を実装するバックエンドです。
 
+本番作業では、最初に [`DEPLOYMENT.md`](./DEPLOYMENT.md) の対象確認・移行・検証・ロールバック手順をすべて確認してください。
+
 PaperLens の基本方針に合わせて、PDF本体・論文メタデータ・注釈・翻訳本文はサーバーへ保存しません。Go API は PaperLens 管理 LLM、アカウント、プラン、クレジット台帳、翻訳リクエストの状態だけを扱います。
 
 ## 開発
