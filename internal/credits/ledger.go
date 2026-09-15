@@ -11,7 +11,7 @@ import (
 	"github.com/micanis/paperlens/backend/internal/contract"
 )
 
-const DefaultRateVersion = "2026-09-01"
+const DefaultRateVersion = "2026-09-14-models"
 const DefaultPriceVersion = "2026-09-01"
 
 // RatePolicy is versioned so a later pricing change never changes the
@@ -29,13 +29,26 @@ type RatePolicy struct {
 type ModelCost struct {
 	InputMicroUSDPerMillion  int64 `json:"inputMicroUsdPerMillion"`
 	OutputMicroUSDPerMillion int64 `json:"outputMicroUsdPerMillion"`
+	// CreditMultiplier is applied to the normalized token charge. It is an
+	// integer so administrators can change model positioning without floating
+	// point accounting in the ledger.
+	CreditMultiplier int64 `json:"creditMultiplier"`
 }
 
 func DefaultRatePolicy() RatePolicy {
 	return RatePolicy{
 		Version: DefaultRateVersion, InputTokensPerCredit: 1000,
 		OutputTokensPerCredit: 1000, OutputWeight: 2,
-		Models: map[string]ModelCost{"default": {InputMicroUSDPerMillion: 0, OutputMicroUSDPerMillion: 0}},
+		Models: map[string]ModelCost{
+			"default":                          {InputMicroUSDPerMillion: 0, OutputMicroUSDPerMillion: 0},
+			"gpt-6-astra":                      {InputMicroUSDPerMillion: 10_000, OutputMicroUSDPerMillion: 50_000, CreditMultiplier: 10},
+			"gpt-5.6-sol":                      {InputMicroUSDPerMillion: 4_000, OutputMicroUSDPerMillion: 20_000, CreditMultiplier: 4},
+			"gpt-5.6-terra":                    {InputMicroUSDPerMillion: 2_000, OutputMicroUSDPerMillion: 12_000, CreditMultiplier: 2},
+			"gpt-5.6-luna":                     {InputMicroUSDPerMillion: 200, OutputMicroUSDPerMillion: 1_200, CreditMultiplier: 1},
+			"shisa-ai/shisa-v2.1-llama3.3-70b": {InputMicroUSDPerMillion: 600, OutputMicroUSDPerMillion: 1_200, CreditMultiplier: 1},
+			"google/translategemma-27b-it":     {InputMicroUSDPerMillion: 0, OutputMicroUSDPerMillion: 0, CreditMultiplier: 1},
+			"gemini-3.8-flash":                 {InputMicroUSDPerMillion: 750, OutputMicroUSDPerMillion: 3_750, CreditMultiplier: 2},
+		},
 	}
 }
 
@@ -50,7 +63,7 @@ func (p RatePolicy) Validate() error {
 		return fmt.Errorf("rate policy must contain between 1 and 100 models")
 	}
 	for model, cost := range p.Models {
-		if strings.TrimSpace(model) == "" || len(model) > 128 || cost.InputMicroUSDPerMillion < 0 || cost.OutputMicroUSDPerMillion < 0 {
+		if strings.TrimSpace(model) == "" || len(model) > 128 || cost.InputMicroUSDPerMillion < 0 || cost.OutputMicroUSDPerMillion < 0 || cost.CreditMultiplier < 0 {
 			return fmt.Errorf("rate policy contains an invalid model cost")
 		}
 	}

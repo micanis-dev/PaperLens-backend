@@ -91,6 +91,89 @@ func TestLogoutClearsAndRevokesSession(t *testing.T) {
 	}
 }
 
+func TestDevelopmentTestUsersIssueSeparateSessions(t *testing.T) {
+	ledger := credits.NewLedger(nil)
+	service := translation.NewService(translation.NewMemoryRepository(), ledger, provider.EchoProvider{}, nil)
+	accountService := account.NewService(account.NewMemoryStore(), nil)
+	authenticator := auth.SessionAuthenticator{CookieName: "session", Secret: []byte("development-test-session-secret")}
+	cfg := config.Config{
+		AppEnv: "development", SessionCookieName: "session", FrontendOrigins: []string{"http://frontend.test"},
+		DevTestUsers: []config.DevTestUser{{ID: "test-1", Label: "Test 1"}, {ID: "test-2", Label: "Test 2"}, {ID: "test-3", Label: "Test 3"}, {ID: "test-4", Label: "Test 4"}},
+	}
+	server := NewHandler(cfg, authenticator, ledger, service).WithAccountService(accountService).Routes()
+	list := httptest.NewRecorder()
+	server.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/auth/test-users", nil))
+	if list.Code != http.StatusOK || strings.Count(list.Body.String(), `"id"`) != 4 {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+
+	for _, expected := range cfg.DevTestUsers {
+		login := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/auth/test-users/"+expected.ID, strings.NewReader(`{}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", "http://frontend.test")
+		server.ServeHTTP(login, request)
+		if login.Code != http.StatusOK {
+			t.Fatalf("login %s status=%d body=%s", expected.ID, login.Code, login.Body.String())
+		}
+		cookie := login.Result().Cookies()[0]
+		accountResponse := httptest.NewRecorder()
+		accountRequest := httptest.NewRequest(http.MethodGet, "/v1/account", nil)
+		accountRequest.AddCookie(cookie)
+		server.ServeHTTP(accountResponse, accountRequest)
+		if accountResponse.Code != http.StatusOK || !strings.Contains(accountResponse.Body.String(), expected.ID) {
+			t.Fatalf("account %s status=%d body=%s", expected.ID, accountResponse.Code, accountResponse.Body.String())
+		}
+	}
+}
+
+func TestDevelopmentTestUsersAreUnavailableInProduction(t *testing.T) {
+	ledger := credits.NewLedger(nil)
+	service := translation.NewService(translation.NewMemoryRepository(), ledger, provider.EchoProvider{}, nil)
+	server := NewHandler(config.Config{AppEnv: "production", DevTestUsers: []config.DevTestUser{{ID: "test-1", Label: "Test 1"}}}, auth.SessionAuthenticator{}, ledger, service).Routes()
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/auth/test-users", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestPasswordRegistrationAndLoginIssueSession(t *testing.T) {
+	ledger := credits.NewLedger(nil)
+	service := translation.NewService(translation.NewMemoryRepository(), ledger, provider.EchoProvider{}, nil)
+	login := auth.NewLoginService(auth.LoginConfig{AppEnv: "development"}, nil, nil, time.Now).WithCredentialStore(auth.NewMemoryCredentialStore())
+	authenticator := auth.SessionAuthenticator{CookieName: "session", Secret: []byte("development-password-session-secret")}
+	server := NewHandler(config.Config{AppEnv: "development", SessionCookieName: "session", FrontendOrigins: []string{"http://frontend.test"}}, authenticator, ledger, service).
+		WithLoginService(login).WithAccountService(account.NewService(account.NewMemoryStore(), nil)).Routes()
+
+	register := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/auth/register", strings.NewReader(`{"email":"person@example.com","password":"a-strong-password"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://frontend.test")
+	server.ServeHTTP(register, request)
+	if register.Code != http.StatusCreated || len(register.Result().Cookies()) != 1 {
+		t.Fatalf("register status=%d cookies=%v body=%s", register.Code, register.Result().Cookies(), register.Body.String())
+	}
+
+	loginRequest := httptest.NewRequest(http.MethodPost, "/v1/auth/login", strings.NewReader(`{"email":"person@example.com","password":"a-strong-password"}`))
+	loginRequest.Header.Set("Content-Type", "application/json")
+	loginRequest.Header.Set("Origin", "http://frontend.test")
+	loginResponse := httptest.NewRecorder()
+	server.ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusOK || len(loginResponse.Result().Cookies()) != 1 {
+		t.Fatalf("login status=%d cookies=%v body=%s", loginResponse.Code, loginResponse.Result().Cookies(), loginResponse.Body.String())
+	}
+
+	wrongRequest := httptest.NewRequest(http.MethodPost, "/v1/auth/login", strings.NewReader(`{"email":"person@example.com","password":"wrong-password"}`))
+	wrongRequest.Header.Set("Content-Type", "application/json")
+	wrongRequest.Header.Set("Origin", "http://frontend.test")
+	wrongResponse := httptest.NewRecorder()
+	server.ServeHTTP(wrongResponse, wrongRequest)
+	if wrongResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password status=%d body=%s", wrongResponse.Code, wrongResponse.Body.String())
+	}
+}
+
 func TestTranslationAndIdempotency(t *testing.T) {
 	payload := `{"documentId":"paper_1","sourceLanguage":"en","targetLanguage":"ja","preserveFormatting":true,"segments":[{"id":"seg_1","pageNumber":1,"order":0,"text":"hello","textHash":"hash"}]}`
 	server := testHandler()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -73,8 +74,22 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/healthz", h.health)
 	mux.HandleFunc("GET /v1/internal/metrics", h.metricsEndpoint)
 	mux.HandleFunc("POST /v1/auth/logout", h.logout)
+	mux.HandleFunc("POST /v1/auth/register", h.registerPassword)
+	mux.HandleFunc("POST /v1/auth/login", h.loginPassword)
 	mux.HandleFunc("GET /v1/auth/google", h.googleLogin)
+	mux.HandleFunc("GET /v1/auth/google/signup", h.googleSignup)
 	mux.HandleFunc("GET /v1/auth/google/callback", h.googleCallback)
+	mux.HandleFunc("GET /v1/auth/apple", h.oauthLogin)
+	mux.HandleFunc("GET /v1/auth/apple/signup", h.oauthLogin)
+	mux.HandleFunc("GET /v1/auth/apple/callback", h.oauthCallback)
+	mux.HandleFunc("GET /v1/auth/github", h.oauthLogin)
+	mux.HandleFunc("GET /v1/auth/github/signup", h.oauthLogin)
+	mux.HandleFunc("GET /v1/auth/github/callback", h.oauthCallback)
+	mux.HandleFunc("GET /v1/auth/link/{provider}", h.linkOAuth)
+	mux.HandleFunc("GET /v1/auth/identities", h.identities)
+	mux.HandleFunc("DELETE /v1/auth/identities/{provider}", h.unlinkOAuth)
+	mux.HandleFunc("GET /v1/auth/test-users", h.listDevTestUsers)
+	mux.HandleFunc("POST /v1/auth/test-users/{id}", h.loginDevTestUser)
 	mux.HandleFunc("POST /v1/auth/magic-link", h.requestMagicLink)
 	mux.HandleFunc("GET /v1/auth/magic-link/verify", h.verifyMagicLink)
 	mux.HandleFunc("GET /v1/plans", h.plans)
@@ -118,11 +133,15 @@ type sessionRefresher interface {
 }
 
 func (h *Handler) googleLogin(w http.ResponseWriter, request *http.Request) {
+	h.oauthLogin(w, request)
+}
+
+func (h *Handler) oauthLogin(w http.ResponseWriter, request *http.Request) {
 	if h.login == nil {
 		h.loginError(w, request, auth.ErrLoginNotConfigured)
 		return
 	}
-	location, err := h.login.GoogleURL()
+	location, err := h.login.OAuthURL(oauthProviderFromPath(request), "")
 	if err != nil {
 		h.loginError(w, request, err)
 		return
@@ -130,20 +149,163 @@ func (h *Handler) googleLogin(w http.ResponseWriter, request *http.Request) {
 	http.Redirect(w, request, location, http.StatusFound)
 }
 
+// googleSignup intentionally uses the same OAuth flow as login. Google is
+// the identity provider; whether the stable identity is new or existing is
+// resolved by the account provisioning step after the callback.
+func (h *Handler) googleSignup(w http.ResponseWriter, request *http.Request) {
+	h.googleLogin(w, request)
+}
+
 func (h *Handler) googleCallback(w http.ResponseWriter, request *http.Request) {
+	h.oauthCallback(w, request)
+}
+
+func (h *Handler) oauthCallback(w http.ResponseWriter, request *http.Request) {
 	if h.login == nil {
 		h.loginError(w, request, auth.ErrLoginNotConfigured)
 		return
 	}
-	userID, err := h.login.CompleteGoogle(request)
+	profile, state, err := h.login.CompleteOAuth(request)
 	if err != nil {
 		h.loginError(w, request, err)
 		return
+	}
+	if profile.Provider != oauthProviderFromPath(request) {
+		h.loginError(w, request, auth.ErrInvalidLogin)
+		return
+	}
+	if state.UserID != "" {
+		identity, authenticated := h.auth.Authenticate(request)
+		if !authenticated || identity.UserID != state.UserID {
+			h.loginError(w, request, auth.ErrInvalidCredentials)
+			return
+		}
+		if err := h.login.LinkOAuth(request.Context(), state.UserID, profile); err != nil {
+			h.loginError(w, request, err)
+			return
+		}
+		http.Redirect(w, request, h.login.FrontendBaseURL()+"/settings/?sso=linked&provider="+url.QueryEscape(profile.Provider), http.StatusFound)
+		return
+	}
+	userID, err := h.login.ResolveOAuth(request.Context(), profile)
+	if err != nil {
+		h.loginError(w, request, err)
+		return
+	}
+	if h.accountService != nil {
+		if err := h.accountService.Ensure(request.Context(), userID); err != nil {
+			h.loginError(w, request, err)
+			return
+		}
 	}
 	if !h.issueSession(w, userID, request) {
 		return
 	}
 	http.Redirect(w, request, h.login.FrontendBaseURL(), http.StatusFound)
+}
+
+func (h *Handler) registerPassword(w http.ResponseWriter, request *http.Request) {
+	if h.login == nil {
+		h.loginError(w, request, auth.ErrLoginNotConfigured)
+		return
+	}
+	var payload struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if !h.decodeJSON(w, request, &payload) {
+		return
+	}
+	userID, err := h.login.RegisterPassword(payload.Email, payload.Password)
+	if err != nil {
+		h.loginError(w, request, err)
+		return
+	}
+	if h.accountService != nil {
+		if err := h.accountService.Ensure(request.Context(), userID); err != nil {
+			h.loginError(w, request, err)
+			return
+		}
+	}
+	if !h.issueSession(w, userID, request) {
+		return
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"requestId": httpx.RequestID(request), "registered": true})
+}
+
+func (h *Handler) loginPassword(w http.ResponseWriter, request *http.Request) {
+	if h.login == nil {
+		h.loginError(w, request, auth.ErrLoginNotConfigured)
+		return
+	}
+	var payload struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if !h.decodeJSON(w, request, &payload) {
+		return
+	}
+	userID, err := h.login.LoginPassword(payload.Email, payload.Password)
+	if err != nil {
+		h.loginError(w, request, err)
+		return
+	}
+	if h.accountService != nil {
+		if err := h.accountService.Ensure(request.Context(), userID); err != nil {
+			h.loginError(w, request, err)
+			return
+		}
+	}
+	if !h.issueSession(w, userID, request) {
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"requestId": httpx.RequestID(request), "loggedIn": true})
+}
+
+func (h *Handler) linkOAuth(w http.ResponseWriter, request *http.Request) {
+	identity, ok := h.identity(w, request)
+	if !ok || h.login == nil {
+		return
+	}
+	location, err := h.login.OAuthURL(request.PathValue("provider"), identity.UserID)
+	if err != nil {
+		h.loginError(w, request, err)
+		return
+	}
+	http.Redirect(w, request, location, http.StatusFound)
+}
+
+func (h *Handler) identities(w http.ResponseWriter, request *http.Request) {
+	identity, ok := h.identity(w, request)
+	if !ok || h.login == nil {
+		return
+	}
+	items, err := h.login.ListOAuthIdentities(request.Context(), identity.UserID)
+	if err != nil {
+		h.loginError(w, request, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"requestId": httpx.RequestID(request), "identities": items})
+}
+
+func (h *Handler) unlinkOAuth(w http.ResponseWriter, request *http.Request) {
+	identity, ok := h.identity(w, request)
+	if !ok || h.login == nil {
+		return
+	}
+	if err := h.login.UnlinkOAuth(request.Context(), identity.UserID, request.PathValue("provider")); err != nil {
+		h.loginError(w, request, err)
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"requestId": httpx.RequestID(request), "unlinked": true})
+}
+
+func oauthProviderFromPath(request *http.Request) string {
+	parts := strings.Split(strings.Trim(request.URL.Path, "/"), "/")
+	if len(parts) >= 3 {
+		return parts[2]
+	}
+	return ""
 }
 
 func (h *Handler) requestMagicLink(w http.ResponseWriter, request *http.Request) {
@@ -182,6 +344,12 @@ func (h *Handler) verifyMagicLink(w http.ResponseWriter, request *http.Request) 
 		h.loginError(w, request, err)
 		return
 	}
+	if h.accountService != nil {
+		if err := h.accountService.Ensure(request.Context(), userID); err != nil {
+			h.loginError(w, request, err)
+			return
+		}
+	}
 	if !h.issueSession(w, userID, request) {
 		return
 	}
@@ -209,8 +377,76 @@ func (h *Handler) loginError(w http.ResponseWriter, request *http.Request, err e
 		code = contract.ErrInvalidRequest
 		status = http.StatusBadRequest
 		message = "the login link or authorization response is invalid"
+	} else if errors.Is(err, account.ErrAlreadyDeleted) {
+		code = contract.ErrForbidden
+		status = http.StatusForbidden
+		message = "this account is no longer available"
+	} else if errors.Is(err, auth.ErrInvalidCredentials) {
+		code = contract.ErrUnauthorized
+		status = http.StatusUnauthorized
+		message = "email or password is incorrect"
+	} else if errors.Is(err, auth.ErrEmailAlreadyRegistered) {
+		code = contract.ErrInvalidRequest
+		status = http.StatusConflict
+		message = "this email address is already registered"
+	} else if errors.Is(err, auth.ErrPasswordTooShort) {
+		code = contract.ErrInvalidRequest
+		status = http.StatusBadRequest
+		message = "password must be at least 12 characters"
+	} else if errors.Is(err, auth.ErrIdentityAlreadyLinked) {
+		code = contract.ErrInvalidRequest
+		status = http.StatusConflict
+		message = "this SSO account is already linked"
+	} else if errors.Is(err, auth.ErrIdentityNotLinked) || errors.Is(err, auth.ErrLastAuthMethod) {
+		code = contract.ErrInvalidRequest
+		status = http.StatusBadRequest
+		message = "the SSO account could not be unlinked"
 	}
 	httpx.Error(w, status, httpx.RequestID(request), code, message, status >= 500)
+}
+
+func (h *Handler) listDevTestUsers(w http.ResponseWriter, request *http.Request) {
+	if h.config.AppEnv == "production" || len(h.config.DevTestUsers) == 0 {
+		http.NotFound(w, request)
+		return
+	}
+	users := make([]map[string]string, 0, len(h.config.DevTestUsers))
+	for _, user := range h.config.DevTestUsers {
+		users = append(users, map[string]string{"id": user.ID, "label": user.Label})
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"requestId": httpx.RequestID(request), "users": users})
+}
+
+func (h *Handler) loginDevTestUser(w http.ResponseWriter, request *http.Request) {
+	if h.config.AppEnv == "production" {
+		http.NotFound(w, request)
+		return
+	}
+	id := request.PathValue("id")
+	var selected *config.DevTestUser
+	for index := range h.config.DevTestUsers {
+		if h.config.DevTestUsers[index].ID == id {
+			selected = &h.config.DevTestUsers[index]
+			break
+		}
+	}
+	if selected == nil {
+		http.NotFound(w, request)
+		return
+	}
+	if h.accountService != nil {
+		if err := h.accountService.Ensure(request.Context(), selected.ID); err != nil {
+			h.loginError(w, request, err)
+			return
+		}
+	}
+	if !h.issueSession(w, selected.ID, request) {
+		return
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{
+		"requestId": httpx.RequestID(request),
+		"user":      map[string]string{"id": selected.ID, "label": selected.Label},
+	})
 }
 
 func (h *Handler) health(w http.ResponseWriter, request *http.Request) {
@@ -950,12 +1186,12 @@ func (h *Handler) withCORS(next http.Handler) http.Handler {
 				httpx.Error(w, http.StatusForbidden, httpx.RequestID(request), contract.ErrForbidden, "origin is not allowed", false)
 				return
 			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, X-Request-ID")
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if (request.Method == http.MethodPost || request.Method == http.MethodPut) && origin != "" && !h.allowedOrigin(origin) {
+		if (request.Method == http.MethodPost || request.Method == http.MethodPut || request.Method == http.MethodDelete) && origin != "" && !h.allowedOrigin(origin) {
 			if request.URL.Path == "/v1/stripe/webhook" {
 				next.ServeHTTP(w, request)
 				return
@@ -963,7 +1199,7 @@ func (h *Handler) withCORS(next http.Handler) http.Handler {
 			httpx.Error(w, http.StatusForbidden, httpx.RequestID(request), contract.ErrForbidden, "origin is not allowed", false)
 			return
 		}
-		if (request.Method == http.MethodPost || request.Method == http.MethodPut) && h.config.AppEnv == "production" && origin == "" && request.URL.Path != "/v1/stripe/webhook" {
+		if (request.Method == http.MethodPost || request.Method == http.MethodPut || request.Method == http.MethodDelete) && h.config.AppEnv == "production" && origin == "" && request.URL.Path != "/v1/stripe/webhook" {
 			httpx.Error(w, http.StatusForbidden, httpx.RequestID(request), contract.ErrForbidden, "origin is required for state-changing requests", false)
 			return
 		}

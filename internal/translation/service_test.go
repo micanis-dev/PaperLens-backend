@@ -66,6 +66,39 @@ func TestRatePolicyIsVersionedOnFutureTranslations(t *testing.T) {
 	}
 }
 
+func TestManagedModelRateChangesEstimateAndProviderModel(t *testing.T) {
+	ledger := credits.NewLedger(time.Now)
+	service := NewService(NewMemoryRepository(), ledger, provider.EchoProvider{}, time.Now)
+	request := testRequest()
+	request.Model = "gpt-6-astra"
+	estimate, err := service.Estimate("user_1", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate.EstimatedCredits != 30 {
+		t.Fatalf("astra estimate=%d, want 30", estimate.EstimatedCredits)
+	}
+	if err := ledger.SetPlan("user_1", "plus"); err != nil {
+		t.Fatal(err)
+	}
+	resource, err := service.Start(context.Background(), "user_1", "012345678901234567890123456789012345", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resource.Model != request.Model || resource.Result == nil || resource.Result.Provider.Model != request.Model {
+		t.Fatalf("model was not propagated: resource=%+v result=%+v", resource, resource.Result)
+	}
+}
+
+func TestUnknownManagedModelIsRejected(t *testing.T) {
+	service := NewService(NewMemoryRepository(), credits.NewLedger(time.Now), provider.EchoProvider{}, time.Now)
+	request := testRequest()
+	request.Model = "unknown-model"
+	if _, err := service.Estimate("user_1", request); err == nil {
+		t.Fatal("unknown managed model was accepted")
+	}
+}
+
 func TestIdempotencyConflictDoesNotRunProviderAgain(t *testing.T) {
 	ledger := credits.NewLedger(time.Now)
 	service := NewService(NewMemoryRepository(), ledger, provider.EchoProvider{}, time.Now)

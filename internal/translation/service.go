@@ -172,6 +172,7 @@ func (s *Service) RatePolicy() credits.RatePolicy {
 }
 
 type Estimate struct {
+	Model                 string        `json:"model"`
 	InputTokens           int64         `json:"inputTokens"`
 	EstimatedOutputTokens int64         `json:"estimatedOutputTokens"`
 	EstimatedCredits      int64         `json:"estimatedCredits"`
@@ -186,8 +187,14 @@ func (s *Service) Estimate(userID string, request contract.TranslationRequest) (
 	plan := s.ledger.Plan(userID)
 	input, output := estimateUsage(request)
 	policy := s.RatePolicy()
-	creditEstimate := creditsFor(policy, input, output)
-	return Estimate{InputTokens: input, EstimatedOutputTokens: output, EstimatedCredits: creditEstimate, Plan: plan, RateVersion: policy.Version}, nil
+	model := s.requestModel(request)
+	if strings.TrimSpace(request.Model) != "" {
+		if _, ok := policy.Models[model]; !ok {
+			return Estimate{}, &RequestError{Code: contract.ErrInvalidRequest, Message: "unsupported managed model", Retryable: false}
+		}
+	}
+	creditEstimate := creditsFor(policy, model, input, output)
+	return Estimate{Model: model, InputTokens: input, EstimatedOutputTokens: output, EstimatedCredits: creditEstimate, Plan: plan, RateVersion: policy.Version}, nil
 }
 
 func (s *Service) Start(ctx context.Context, userID, idempotencyKey string, request contract.TranslationRequest) (*contract.TranslationResource, error) {
@@ -229,6 +236,7 @@ func (s *Service) start(ctx context.Context, userID, idempotencyKey string, requ
 		plan = s.ledger.Plan(userID)
 	}
 	policy := s.RatePolicy()
+	model := s.requestModel(request)
 	// Serialize only the lookup/create boundary. The provider call happens
 	// outside this lock so independent requests can use the plan's concurrency.
 	s.startMu.Lock()
@@ -255,7 +263,7 @@ func (s *Service) start(ctx context.Context, userID, idempotencyKey string, requ
 		}
 	}
 	now := s.now()
-	resource := &contract.TranslationResource{ID: id, UserID: userID, IdempotencyKey: idempotencyKey, RequestHash: hash, Mode: contract.ModePaperLensManaged, Model: s.provider.Model(), RateVersion: policy.Version, Status: contract.StatusRunning, CreatedAt: now, SourceLanguage: request.SourceLanguage, TargetLanguage: request.TargetLanguage, SegmentCount: len(request.Segments), CreditsReserved: estimate.EstimatedCredits}
+	resource := &contract.TranslationResource{ID: id, UserID: userID, IdempotencyKey: idempotencyKey, RequestHash: hash, Mode: contract.ModePaperLensManaged, Model: model, RateVersion: policy.Version, Status: contract.StatusRunning, CreatedAt: now, SourceLanguage: request.SourceLanguage, TargetLanguage: request.TargetLanguage, SegmentCount: len(request.Segments), CreditsReserved: estimate.EstimatedCredits}
 	if err := s.repository.Create(resource); err != nil {
 		if requestModeConsumesCredits(request) {
 			_ = s.releaseCredits(userID, id, policy.Version)
@@ -295,7 +303,7 @@ func (s *Service) start(ctx context.Context, userID, idempotencyKey string, requ
 		s.jobMu.Unlock()
 	}()
 
-	providerResult, err := s.translateWithRetry(providerCtx, provider.Request{RequestID: id, Mode: contract.ModePaperLensManaged, Model: s.provider.Model(), SourceLanguage: request.SourceLanguage, TargetLanguage: request.TargetLanguage, Segments: request.Segments, Glossary: request.Glossary, PreserveFormatting: request.PreserveFormatting}, onSegment)
+	providerResult, err := s.translateWithRetry(providerCtx, provider.Request{RequestID: id, Mode: contract.ModePaperLensManaged, Model: model, SourceLanguage: request.SourceLanguage, TargetLanguage: request.TargetLanguage, Segments: request.Segments, Glossary: request.Glossary, PreserveFormatting: request.PreserveFormatting}, onSegment)
 	if err != nil {
 		s.jobMu.Lock()
 		if current, getErr := s.repository.Get(userID, id); getErr == nil && current.Status == contract.StatusCanceled {
@@ -326,7 +334,8 @@ func (s *Service) start(ctx context.Context, userID, idempotencyKey string, requ
 	}
 
 	providerResult.RequestID = id
-	providerResult.Usage.CreditsUsed = creditsFor(policy, providerResult.Usage.InputTokens, providerResult.Usage.OutputTokens)
+	providerResult.Provider.Model = model
+	providerResult.Usage.CreditsUsed = creditsFor(policy, model, providerResult.Usage.InputTokens, providerResult.Usage.OutputTokens)
 	if requestModeConsumesCredits(request) {
 		if providerResult.Usage.CreditsUsed <= 0 || providerResult.Usage.CreditsUsed > estimate.EstimatedCredits {
 			providerResult.Usage.CreditsUsed = estimate.EstimatedCredits
@@ -351,11 +360,11 @@ func (s *Service) start(ctx context.Context, userID, idempotencyKey string, requ
 		resource.CreditsConsumed = providerResult.Usage.CreditsUsed
 	}
 	if s.observer != nil {
-		modelCost, exists := policy.Models[providerResult.Provider.Model]
+		modelCost, exists := policy.Models[model]
 		if !exists {
 			modelCost = policy.Models["default"]
 		}
-		s.observer.ObserveManagedUsage(providerResult.Provider.Model, providerResult.Usage.InputTokens, providerResult.Usage.OutputTokens, modelCost)
+		s.observer.ObserveManagedUsage(model, providerResult.Usage.InputTokens, providerResult.Usage.OutputTokens, modelCost)
 	}
 	resource.Status = contract.StatusCompleted
 	resource.Result = &providerResult
@@ -598,6 +607,13 @@ func (e *RequestError) Error() string { return e.Message }
 
 func requestModeConsumesCredits(_ contract.TranslationRequest) bool { return true }
 
+func (s *Service) requestModel(request contract.TranslationRequest) string {
+	if strings.TrimSpace(request.Model) != "" {
+		return strings.TrimSpace(request.Model)
+	}
+	return strings.TrimSpace(s.provider.Model())
+}
+
 func validationErrorCode(err error) contract.APIErrorCode {
 	message := err.Error()
 	if strings.Contains(message, "too large") || strings.Contains(message, "too many") {
@@ -614,8 +630,13 @@ func estimateUsage(request contract.TranslationRequest) (int64, int64) {
 	return input, input
 }
 
-func creditsFor(policy credits.RatePolicy, input, output int64) int64 {
-	return ceilBy(input, policy.InputTokensPerCredit) + policy.OutputWeight*ceilBy(output, policy.OutputTokensPerCredit)
+func creditsFor(policy credits.RatePolicy, model string, input, output int64) int64 {
+	base := ceilBy(input, policy.InputTokensPerCredit) + policy.OutputWeight*ceilBy(output, policy.OutputTokensPerCredit)
+	cost, ok := policy.Models[model]
+	if !ok || cost.CreditMultiplier <= 0 {
+		return base
+	}
+	return base * cost.CreditMultiplier
 }
 
 func ceilBy(tokens, unit int64) int64 {
@@ -626,8 +647,9 @@ func ceilBy(tokens, unit int64) int64 {
 }
 
 func cloneRatePolicy(policy credits.RatePolicy) credits.RatePolicy {
+	models := policy.Models
 	policy.Models = map[string]credits.ModelCost{}
-	for model, cost := range policy.Models {
+	for model, cost := range models {
 		policy.Models[model] = cost
 	}
 	return policy

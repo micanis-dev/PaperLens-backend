@@ -45,3 +45,23 @@ func TestDueDeletionMakesAccountInactive(t *testing.T) {
 		t.Fatalf("request after deletion err=%v", err)
 	}
 }
+
+func TestEnsureProvisionsNewUserAndDoesNotReviveDeletedUser(t *testing.T) {
+	store := NewMemoryStore()
+	service := NewService(store, time.Now)
+	if err := service.Ensure(context.Background(), "oauth-user"); err != nil {
+		t.Fatal(err)
+	}
+	if active, err := service.IsActive(context.Background(), "oauth-user"); err != nil || !active {
+		t.Fatalf("active=%t err=%v", active, err)
+	}
+	if _, err := service.RequestDeletion(context.Background(), "oauth-user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ProcessDue(context.Background(), "oauth-user", time.Now().Add(25*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Ensure(context.Background(), "oauth-user"); err != ErrAlreadyDeleted {
+		t.Fatalf("ensure after deletion err=%v", err)
+	}
+}

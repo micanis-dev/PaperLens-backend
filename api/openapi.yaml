@@ -54,6 +54,55 @@ paths:
                 properties:
                   requestId: { type: string }
                   loggedOut: { type: boolean }
+  /v1/auth/register:
+    post:
+      security: []
+      summary: Register with an email address and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordAuthRequest'
+      responses:
+        '201': { description: Account created and session cookie issued }
+        '400': { $ref: '#/components/responses/ApiError' }
+        '409': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/login:
+    post:
+      security: []
+      summary: Log in with an email address and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordAuthRequest'
+      responses:
+        '200': { description: Session cookie issued }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/apple:
+    get:
+      security: []
+      responses:
+        '302': { description: Redirect to Apple OAuth }
+  /v1/auth/apple/callback:
+    get:
+      security: []
+      responses:
+        '302': { description: Set session cookie and redirect to frontend }
+        '400': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/github:
+    get:
+      security: []
+      responses:
+        '302': { description: Redirect to GitHub OAuth }
+  /v1/auth/github/callback:
+    get:
+      security: []
+      responses:
+        '302': { description: Set session cookie and redirect to frontend }
+        '400': { $ref: '#/components/responses/ApiError' }
   /v1/auth/google:
     get:
       security: []
@@ -68,6 +117,29 @@ paths:
       responses:
         '302': { description: Set session cookie and redirect to frontend }
         '400': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/link/{provider}:
+    get:
+      summary: Start explicit SSO linking for the authenticated account
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [apple, google, github] } }
+      responses:
+        '302': { description: Redirect to the selected OAuth provider }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/identities:
+    get:
+      summary: List linked SSO providers
+      responses:
+        '200': { description: Linked provider list }
+        '401': { $ref: '#/components/responses/ApiError' }
+  /v1/auth/identities/{provider}:
+    delete:
+      summary: Explicitly unlink an SSO provider
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, enum: [apple, google, github] } }
+      responses:
+        '200': { description: Provider unlinked }
+        '400': { $ref: '#/components/responses/ApiError' }
+        '401': { $ref: '#/components/responses/ApiError' }
   /v1/auth/magic-link:
     post:
       security: []
@@ -286,6 +358,12 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
   schemas:
+    PasswordAuthRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 320 }
+        password: { type: string, minLength: 12, maxLength: 1024 }
     TranslationEnvelope:
       type: object
       required: [requestId, translation]
@@ -317,6 +395,7 @@ components:
         documentId: { type: string }
         sourceLanguage: { type: string, example: auto }
         targetLanguage: { type: string, example: ja }
+        model: { type: string, description: Managed model ID; required for PaperLens-managed translations }
         preserveFormatting: { type: boolean }
         segments:
           type: array
@@ -329,6 +408,16 @@ components:
               order: { type: integer, minimum: 0 }
               text: { type: string }
               textHash: { type: string }
+    Estimate:
+      type: object
+      required: [model, inputTokens, estimatedOutputTokens, estimatedCredits, plan, rateVersion]
+      properties:
+        model: { type: string }
+        inputTokens: { type: integer, minimum: 0 }
+        estimatedOutputTokens: { type: integer, minimum: 0 }
+        estimatedCredits: { type: integer, minimum: 0 }
+        plan: { $ref: '#/components/schemas/Plan' }
+        rateVersion: { type: string }
     TranslationResult:
       type: object
       required: [requestId, segments, usage, provider, warnings]
@@ -405,3 +494,4 @@ components:
             properties:
               inputMicroUsdPerMillion: { type: integer, minimum: 0 }
               outputMicroUsdPerMillion: { type: integer, minimum: 0 }
+              creditMultiplier: { type: integer, minimum: 0, description: Multiplier applied to normalized token credits }

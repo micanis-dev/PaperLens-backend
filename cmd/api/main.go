@@ -102,7 +102,12 @@ func main() {
 	}
 	loginConfig := auth.LoginConfig{
 		AppEnv: cfg.AppEnv, GoogleClientID: cfg.GoogleClientID, GoogleClientSecret: cfg.GoogleClientSecret,
-		GoogleRedirectURL: cfg.GoogleRedirectURL, FrontendBaseURL: cfg.FrontendBaseURL, MagicLinkBaseURL: cfg.MagicLinkBaseURL,
+		GoogleRedirectURL: cfg.GoogleRedirectURL, AppleClientID: cfg.AppleClientID, AppleClientSecret: cfg.AppleClientSecret,
+		AppleRedirectURL: cfg.AppleRedirectURL, AppleTeamID: cfg.AppleTeamID, AppleKeyID: cfg.AppleKeyID, ApplePrivateKey: cfg.ApplePrivateKey,
+		AppleAuthURL: cfg.AppleAuthURL, AppleTokenURL: cfg.AppleTokenURL, AppleJWKSURL: cfg.AppleJWKSURL,
+		GitHubClientID: cfg.GitHubClientID, GitHubClientSecret: cfg.GitHubClientSecret, GitHubRedirectURL: cfg.GitHubRedirectURL,
+		GitHubAuthURL: cfg.GitHubAuthURL, GitHubTokenURL: cfg.GitHubTokenURL, GitHubUserInfoURL: cfg.GitHubUserInfoURL, GitHubEmailURL: cfg.GitHubEmailURL,
+		FrontendBaseURL: cfg.FrontendBaseURL, MagicLinkBaseURL: cfg.MagicLinkBaseURL,
 		SMTPHost: cfg.SMTPHost, SMTPPort: cfg.SMTPPort, SMTPUsername: cfg.SMTPUsername, SMTPPassword: cfg.SMTPPassword, SMTPFrom: cfg.SMTPFrom,
 	}
 	var emailSender auth.EmailSender
@@ -110,10 +115,20 @@ func main() {
 		emailSender = auth.SMTPEmailSender(loginConfig)
 	}
 	loginService := auth.NewLoginService(loginConfig, nil, emailSender, time.Now)
+	var credentialStore auth.CredentialStore = auth.NewMemoryCredentialStore()
 	if database != nil {
 		loginService.WithStore(persistence.NewPostgresLoginStore(database))
+		credentialStore = persistence.NewPostgresCredentialStore(database)
 	}
+	loginService.WithCredentialStore(credentialStore)
 	accountService := account.NewService(accountStore, time.Now)
+	if cfg.AppEnv != "production" {
+		for _, testUser := range cfg.DevTestUsers {
+			if err := accountService.Ensure(context.Background(), testUser.ID); err != nil {
+				logger.Warn("development test user could not be provisioned", "user_id", testUser.ID, "error", err)
+			}
+		}
+	}
 	handler := api.NewHandler(cfg, authenticator, ledger, service).WithMetrics(metrics).WithLoginService(loginService).WithBillingService(billingService).WithAccountService(accountService)
 	if ratePolicyStore != nil {
 		handler.WithRatePolicyPersistence(ratePolicyStore.Save)

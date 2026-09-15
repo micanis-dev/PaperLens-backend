@@ -86,7 +86,7 @@ func isLanguage(language string) bool {
 
 func HashRequest(request TranslationRequest) string {
 	hash := sha256.New()
-	fmt.Fprintf(hash, "%s\x00%s\x00%s\x00%t\x00", request.DocumentID, request.SourceLanguage, request.TargetLanguage, request.PreserveFormatting)
+	fmt.Fprintf(hash, "%s\x00%s\x00%s\x00%s\x00%t\x00", request.DocumentID, request.SourceLanguage, request.TargetLanguage, request.Model, request.PreserveFormatting)
 	for _, segment := range request.Segments {
 		fmt.Fprintf(hash, "%s\x00%d\x00%d\x00%s\x00%s\x00", segment.ID, segment.PageNumber, segment.Order, segment.Text, segment.TextHash)
 	}

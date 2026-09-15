@@ -81,7 +81,7 @@ func (h *Handler) withRateLimits(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if request.Method == http.MethodPost && request.URL.Path == "/v1/auth/magic-link" {
+		if request.Method == http.MethodPost && (request.URL.Path == "/v1/auth/magic-link" || request.URL.Path == "/v1/auth/login" || request.URL.Path == "/v1/auth/register") {
 			if !writeRateLimitError(w, request, loginLimiter, "login request rate limit reached") {
 				return
 			}

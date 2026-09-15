@@ -1,14 +1,13 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/mail"
 	"net/smtp"
@@ -32,6 +31,22 @@ type LoginConfig struct {
 	GoogleRedirectURL  string
 	GoogleTokenURL     string
 	GoogleUserInfoURL  string
+	AppleClientID      string
+	AppleClientSecret  string
+	AppleRedirectURL   string
+	AppleTeamID        string
+	AppleKeyID         string
+	ApplePrivateKey    string
+	AppleAuthURL       string
+	AppleTokenURL      string
+	AppleJWKSURL       string
+	GitHubClientID     string
+	GitHubClientSecret string
+	GitHubRedirectURL  string
+	GitHubAuthURL      string
+	GitHubTokenURL     string
+	GitHubUserInfoURL  string
+	GitHubEmailURL     string
 	FrontendBaseURL    string
 	MagicLinkBaseURL   string
 	SMTPHost           string
@@ -39,19 +54,21 @@ type LoginConfig struct {
 	SMTPUsername       string
 	SMTPPassword       string
 	SMTPFrom           string
+	OAuthProviders     map[string]OAuthProviderConfig
 }
 
 type EmailSender func(to, subject, body string) error
 
 type LoginService struct {
-	config LoginConfig
-	now    func() time.Time
-	client *http.Client
-	send   EmailSender
-	store  LoginStore
-	mu     sync.Mutex
-	states map[string]loginState
-	links  map[string]magicLink
+	config      LoginConfig
+	now         func() time.Time
+	client      *http.Client
+	send        EmailSender
+	store       LoginStore
+	credentials CredentialStore
+	mu          sync.Mutex
+	states      map[string]loginState
+	links       map[string]magicLink
 }
 
 // LoginStore is the durable boundary for short-lived OAuth and magic-link
@@ -69,8 +86,15 @@ func (s *LoginService) WithStore(store LoginStore) *LoginService {
 	return s
 }
 
+func (s *LoginService) WithCredentialStore(store CredentialStore) *LoginService {
+	s.credentials = store
+	return s
+}
+
 type loginState struct {
 	expiresAt time.Time
+	provider  string
+	userID    string
 }
 
 type magicLink struct {
@@ -89,116 +113,48 @@ func NewLoginService(config LoginConfig, client *http.Client, send EmailSender, 
 }
 
 func (s *LoginService) GoogleURL() (string, error) {
-	if strings.TrimSpace(s.config.GoogleClientID) == "" || strings.TrimSpace(s.config.GoogleRedirectURL) == "" {
-		return "", ErrLoginNotConfigured
-	}
-	state, err := randomToken(32)
-	if err != nil {
-		return "", err
-	}
-	now := s.now()
-	expiresAt := now.Add(10 * time.Minute)
-	if s.store != nil {
-		if err := s.store.SaveOAuthState(hashToken(state), expiresAt); err != nil {
-			return "", err
-		}
-	}
-	s.mu.Lock()
-	s.cleanupLocked(now)
-	if s.store == nil {
-		s.states[state] = loginState{expiresAt: expiresAt}
-	}
-	s.mu.Unlock()
-	values := url.Values{}
-	values.Set("client_id", s.config.GoogleClientID)
-	values.Set("redirect_uri", s.config.GoogleRedirectURL)
-	values.Set("response_type", "code")
-	values.Set("scope", "openid email profile")
-	values.Set("state", state)
-	values.Set("prompt", "select_account")
-	return "https://accounts.google.com/o/oauth2/v2/auth?" + values.Encode(), nil
+	return s.OAuthURL(ProviderGoogle, "")
 }
 
 func (s *LoginService) CompleteGoogle(request *http.Request) (string, error) {
-	state := strings.TrimSpace(request.URL.Query().Get("state"))
-	code := strings.TrimSpace(request.URL.Query().Get("code"))
-	if state == "" || code == "" {
-		return "", ErrInvalidLogin
-	}
-	now := s.now()
-	ok := false
-	if s.store != nil {
-		var err error
-		ok, err = s.store.ConsumeOAuthState(hashToken(state), now)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		s.mu.Lock()
-		entry, found := s.states[state]
-		if found {
-			delete(s.states, state)
-		}
-		s.cleanupLocked(now)
-		s.mu.Unlock()
-		ok = found && now.Before(entry.expiresAt)
-	}
-	if !ok {
-		return "", ErrExpiredLogin
-	}
-	tokenURL := s.config.GoogleTokenURL
-	if tokenURL == "" {
-		tokenURL = "https://oauth2.googleapis.com/token"
-	}
-	form := url.Values{"code": {code}, "client_id": {s.config.GoogleClientID}, "client_secret": {s.config.GoogleClientSecret}, "redirect_uri": {s.config.GoogleRedirectURL}, "grant_type": {"authorization_code"}}
-	tokenRequest, err := http.NewRequestWithContext(request.Context(), http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+	profile, state, err := s.CompleteOAuth(request)
 	if err != nil {
 		return "", err
 	}
-	tokenRequest.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	tokenResponse, err := s.client.Do(tokenRequest)
+	if profile.Provider != ProviderGoogle || state.UserID != "" {
+		return "", ErrInvalidLogin
+	}
+	return stableUserID(ProviderGoogle, profile.Subject), nil
+}
+
+func (s *LoginService) RegisterPassword(email, password string) (string, error) {
+	if s.credentials == nil {
+		return "", ErrLoginNotConfigured
+	}
+	normalized, err := NormalizeEmail(email)
+	if err != nil {
+		return "", ErrInvalidLogin
+	}
+	passwordHash, err := HashPassword(password)
 	if err != nil {
 		return "", err
 	}
-	defer tokenResponse.Body.Close()
-	if tokenResponse.StatusCode < 200 || tokenResponse.StatusCode >= 300 {
-		return "", ErrInvalidLogin
+	return s.credentials.CreatePasswordUser(context.Background(), EmailHash(normalized), passwordHash)
+}
+
+func (s *LoginService) LoginPassword(email, password string) (string, error) {
+	if s.credentials == nil {
+		return "", ErrLoginNotConfigured
 	}
-	var token struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(io.LimitReader(tokenResponse.Body, 64<<10)).Decode(&token); err != nil || token.AccessToken == "" {
-		return "", ErrInvalidLogin
-	}
-	userInfoURL := s.config.GoogleUserInfoURL
-	if userInfoURL == "" {
-		userInfoURL = "https://openidconnect.googleapis.com/v1/userinfo"
-	}
-	userRequest, err := http.NewRequestWithContext(request.Context(), http.MethodGet, userInfoURL, nil)
+	normalized, err := NormalizeEmail(email)
 	if err != nil {
-		return "", err
+		return "", ErrInvalidCredentials
 	}
-	userRequest.Header.Set("Authorization", "Bearer "+token.AccessToken)
-	userResponse, err := s.client.Do(userRequest)
-	if err != nil {
-		return "", err
+	credential, err := s.credentials.PasswordCredential(context.Background(), EmailHash(normalized))
+	if err != nil || !CheckPassword(credential.PasswordHash, password) {
+		return "", ErrInvalidCredentials
 	}
-	defer userResponse.Body.Close()
-	if userResponse.StatusCode < 200 || userResponse.StatusCode >= 300 {
-		return "", ErrInvalidLogin
-	}
-	var profile struct {
-		Subject  string `json:"sub"`
-		Email    string `json:"email"`
-		Verified bool   `json:"email_verified"`
-	}
-	if err := json.NewDecoder(io.LimitReader(userResponse.Body, 64<<10)).Decode(&profile); err != nil || profile.Subject == "" {
-		return "", ErrInvalidLogin
-	}
-	if profile.Email != "" && !profile.Verified {
-		return "", ErrInvalidLogin
-	}
-	return stableUserID("google", profile.Subject), nil
+	return credential.UserID, nil
 }
 
 // RequestMagicLink stores only a hash of the random token. The raw token is

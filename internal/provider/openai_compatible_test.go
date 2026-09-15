@@ -16,15 +16,21 @@ func TestOpenAICompatibleProviderMapsAndValidatesSegments(t *testing.T) {
 		if request.URL.Path != "/v1/chat/completions" || request.Header.Get("Authorization") != "Bearer key" {
 			t.Fatalf("unexpected provider request: path=%s auth=%q", request.URL.Path, request.Header.Get("Authorization"))
 		}
+		var payload struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil || payload.Model != "selected-model" {
+			t.Fatalf("selected model was not forwarded: %+v err=%v", payload, err)
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []any{map[string]any{"message": map[string]string{"content": `[{"id":"b","translatedText":"B"},{"id":"a","translatedText":"A"}]`}}},
 			"usage":   map[string]int{"prompt_tokens": 10, "completion_tokens": 20},
 		})
 	}))
 	defer server.Close()
-	result, err := (OpenAICompatibleProvider{BaseURL: server.URL + "/v1", APIKey: "key", ModelName: "model", Client: server.Client()}).Translate(context.Background(), Request{
+	result, err := (OpenAICompatibleProvider{BaseURL: server.URL + "/v1", APIKey: "key", ModelName: "default-model", Client: server.Client()}).Translate(context.Background(), Request{
 		Mode:  contract.ModePaperLensManaged,
-		Model: "model",
+		Model: "selected-model",
 		Segments: []contract.TranslationSegment{
 			{ID: "a", PageNumber: 1, Text: "a", TextHash: "ha"},
 			{ID: "b", PageNumber: 1, Text: "b", TextHash: "hb"},

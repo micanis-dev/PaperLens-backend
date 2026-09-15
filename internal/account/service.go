@@ -36,6 +36,28 @@ type Service struct {
 	now   func() time.Time
 }
 
+// Ensure provisions an account at the authentication boundary. OAuth
+// callbacks use this so registration creates the server-side account before a
+// session is handed to the browser.
+func (s *Service) Ensure(ctx context.Context, userID string) error {
+	if s == nil || s.store == nil {
+		return ErrNotFound
+	}
+	if provisioner, ok := s.store.(interface {
+		Ensure(context.Context, string) error
+	}); ok {
+		return provisioner.Ensure(ctx, userID)
+	}
+	active, err := s.store.IsActive(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return ErrAlreadyDeleted
+	}
+	return nil
+}
+
 func NewService(store Store, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
@@ -106,6 +128,15 @@ func (s *MemoryStore) ensure(userID string) bool {
 		return true
 	}
 	return active
+}
+
+func (s *MemoryStore) Ensure(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ensure(userID) {
+		return ErrAlreadyDeleted
+	}
+	return nil
 }
 
 func (s *MemoryStore) RequestDeletion(_ context.Context, userID string, requestedAt, executeAt time.Time) (Deletion, error) {

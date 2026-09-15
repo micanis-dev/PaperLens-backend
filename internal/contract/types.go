@@ -31,9 +31,13 @@ type GlossaryEntry struct {
 }
 
 type TranslationRequest struct {
-	DocumentID         string               `json:"documentId"`
-	SourceLanguage     string               `json:"sourceLanguage"`
-	TargetLanguage     string               `json:"targetLanguage"`
+	DocumentID     string `json:"documentId"`
+	SourceLanguage string `json:"sourceLanguage"`
+	TargetLanguage string `json:"targetLanguage"`
+	// Model is required for PaperLens-managed translations and is ignored for
+	// direct BYOK/local flows. Keeping it in the shared request lets the server
+	// select both the provider model and its credit rate atomically.
+	Model              string               `json:"model,omitempty"`
 	Segments           []TranslationSegment `json:"segments"`
 	Glossary           []GlossaryEntry      `json:"glossary,omitempty"`
 	PreserveFormatting bool                 `json:"preserveFormatting"`

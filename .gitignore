@@ -6,6 +6,7 @@
 .env
 .env.*
 !.env.example
+supabase/.temp/
 /tmp/
 
 # Test and coverage output

@@ -79,9 +79,13 @@ func (p EchoProvider) Translate(_ context.Context, request Request) (contract.Tr
 	if len(request.Segments) == 0 {
 		return contract.TranslationResult{}, &Error{Code: contract.ErrInvalidRequest, Message: "no translation segments", Retryable: false}
 	}
+	model := p.Model()
+	if strings.TrimSpace(request.Model) != "" {
+		model = strings.TrimSpace(request.Model)
+	}
 	result := contract.TranslationResult{
 		Segments: make([]contract.TranslatedSegment, 0, len(request.Segments)),
-		Provider: contract.ProviderInfo{Mode: request.Mode, Name: p.Name(), Model: p.Model()},
+		Provider: contract.ProviderInfo{Mode: request.Mode, Name: p.Name(), Model: model},
 		Warnings: []string{"development provider used; no external LLM was contacted"},
 	}
 	for _, segment := range request.Segments {

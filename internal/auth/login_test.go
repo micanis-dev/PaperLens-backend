@@ -71,6 +71,49 @@ func TestMagicLinkRequiresDeliveryInProduction(t *testing.T) {
 	}
 }
 
+func TestPasswordCredentialCanRegisterLoginAndManageSSO(t *testing.T) {
+	store := NewMemoryCredentialStore()
+	service := NewLoginService(LoginConfig{AppEnv: "development"}, nil, nil, time.Now).WithCredentialStore(store)
+	userID, err := service.RegisterPassword("person@example.com", "a-strong-password")
+	if err != nil || userID == "" {
+		t.Fatalf("register user=%q err=%v", userID, err)
+	}
+	if _, err := service.RegisterPassword("PERSON@example.com", "another-strong-password"); err != ErrEmailAlreadyRegistered {
+		t.Fatalf("duplicate registration err=%v", err)
+	}
+	if loggedIn, err := service.LoginPassword("PERSON@example.com", "a-strong-password"); err != nil || loggedIn != userID {
+		t.Fatalf("login user=%q err=%v", loggedIn, err)
+	}
+	profile := OAuthProfile{Provider: ProviderGoogle, Subject: "google-sub", Email: "person@example.com", EmailVerified: true}
+	if err := service.LinkOAuth(context.Background(), userID, profile); err != nil {
+		t.Fatal(err)
+	}
+	identities, err := service.ListOAuthIdentities(context.Background(), userID)
+	if err != nil || len(identities) != 1 || identities[0].Provider != ProviderGoogle {
+		t.Fatalf("identities=%+v err=%v", identities, err)
+	}
+	if err := service.LinkOAuth(context.Background(), userID, OAuthProfile{Provider: ProviderGoogle, Subject: "another-google-sub", Email: "person@example.com", EmailVerified: true}); err != ErrIdentityAlreadyLinked {
+		t.Fatalf("duplicate provider link error=%v", err)
+	}
+	if err := service.UnlinkOAuth(context.Background(), userID, ProviderGoogle); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOAuthURLsSupportAllConfiguredProviders(t *testing.T) {
+	service := NewLoginService(LoginConfig{
+		GoogleClientID: "google", GoogleRedirectURL: "https://api.test/v1/auth/google/callback",
+		AppleClientID: "apple", AppleRedirectURL: "https://api.test/v1/auth/apple/callback",
+		GitHubClientID: "github", GitHubRedirectURL: "https://api.test/v1/auth/github/callback",
+	}, nil, nil, time.Now)
+	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderGitHub} {
+		location, err := service.OAuthURL(provider, "")
+		if err != nil || !strings.Contains(location, "client_id=") || !strings.Contains(location, "state=") {
+			t.Fatalf("provider=%s location=%q err=%v", provider, location, err)
+		}
+	}
+}
+
 func TestDurableLoginStoreKeepsChallengesOneTime(t *testing.T) {
 	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
 	store := newTestLoginStore()

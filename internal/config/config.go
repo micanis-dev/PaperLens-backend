@@ -25,7 +25,24 @@ type Config struct {
 	GoogleClientID        string
 	GoogleClientSecret    string
 	GoogleRedirectURL     string
+	AppleClientID         string
+	AppleClientSecret     string
+	AppleRedirectURL      string
+	AppleTeamID           string
+	AppleKeyID            string
+	ApplePrivateKey       string
+	AppleAuthURL          string
+	AppleTokenURL         string
+	AppleJWKSURL          string
+	GitHubClientID        string
+	GitHubClientSecret    string
+	GitHubRedirectURL     string
+	GitHubAuthURL         string
+	GitHubTokenURL        string
+	GitHubUserInfoURL     string
+	GitHubEmailURL        string
 	FrontendBaseURL       string
+	DevTestUsers          []DevTestUser
 	MagicLinkBaseURL      string
 	SMTPHost              string
 	SMTPPort              string
@@ -44,14 +61,33 @@ type Config struct {
 	ShutdownTimeout       time.Duration
 }
 
+// DevTestUser is available only to local development. It provides a stable
+// identity for exercising account isolation without creating disposable
+// Google accounts.
+type DevTestUser struct {
+	ID    string
+	Label string
+}
+
 func Load() (Config, error) {
 	timeout, err := durationEnv("SHUTDOWN_TIMEOUT", 10*time.Second)
 	if err != nil {
 		return Config{}, err
 	}
 
+	appEnv := envOr("APP_ENV", "development")
+	devTestUsers := parseDevTestUsers(os.Getenv("DEV_TEST_USERS"))
+	if appEnv != "production" && len(devTestUsers) == 0 {
+		devTestUsers = []DevTestUser{
+			{ID: "test-user-1", Label: "Test user 1"},
+			{ID: "test-user-2", Label: "Test user 2"},
+			{ID: "test-user-3", Label: "Test user 3"},
+			{ID: "test-user-4", Label: "Test user 4"},
+		}
+	}
+
 	cfg := Config{
-		AppEnv:                envOr("APP_ENV", "development"),
+		AppEnv:                appEnv,
 		BaseURL:               envOr("APP_BASE_URL", "http://127.0.0.1:8080"),
 		HTTPAddr:              envOr("HTTP_ADDR", "127.0.0.1:8080"),
 		DatabaseURL:           os.Getenv("DATABASE_URL"),
@@ -65,7 +101,24 @@ func Load() (Config, error) {
 		GoogleClientID:        os.Getenv("GOOGLE_CLIENT_ID"),
 		GoogleClientSecret:    os.Getenv("GOOGLE_CLIENT_SECRET"),
 		GoogleRedirectURL:     os.Getenv("GOOGLE_REDIRECT_URL"),
+		AppleClientID:         os.Getenv("APPLE_CLIENT_ID"),
+		AppleClientSecret:     os.Getenv("APPLE_CLIENT_SECRET"),
+		AppleRedirectURL:      os.Getenv("APPLE_REDIRECT_URL"),
+		AppleTeamID:           os.Getenv("APPLE_TEAM_ID"),
+		AppleKeyID:            os.Getenv("APPLE_KEY_ID"),
+		ApplePrivateKey:       os.Getenv("APPLE_PRIVATE_KEY"),
+		AppleAuthURL:          os.Getenv("APPLE_AUTH_URL"),
+		AppleTokenURL:         os.Getenv("APPLE_TOKEN_URL"),
+		AppleJWKSURL:          os.Getenv("APPLE_JWKS_URL"),
+		GitHubClientID:        os.Getenv("GITHUB_CLIENT_ID"),
+		GitHubClientSecret:    os.Getenv("GITHUB_CLIENT_SECRET"),
+		GitHubRedirectURL:     os.Getenv("GITHUB_REDIRECT_URL"),
+		GitHubAuthURL:         os.Getenv("GITHUB_AUTH_URL"),
+		GitHubTokenURL:        os.Getenv("GITHUB_TOKEN_URL"),
+		GitHubUserInfoURL:     os.Getenv("GITHUB_USER_INFO_URL"),
+		GitHubEmailURL:        os.Getenv("GITHUB_EMAIL_URL"),
 		FrontendBaseURL:       envOr("FRONTEND_BASE_URL", "http://127.0.0.1:5173"),
+		DevTestUsers:          devTestUsers,
 		MagicLinkBaseURL:      envOr("MAGIC_LINK_BASE_URL", "http://127.0.0.1:8080/v1/auth/magic-link/verify"),
 		SMTPHost:              os.Getenv("SMTP_HOST"),
 		SMTPPort:              envOr("SMTP_PORT", "587"),
@@ -84,15 +137,9 @@ func Load() (Config, error) {
 		ShutdownTimeout:       timeout,
 	}
 
-	if cfg.AppEnv == "production" && cfg.ManagedLLMAPIKey == "" {
-		return Config{}, fmt.Errorf("PAPERLENS_LLM_API_KEY is required in production")
-	}
-	if cfg.AppEnv == "production" && cfg.ManagedLLMBaseURL == "" {
-		return Config{}, fmt.Errorf("PAPERLENS_LLM_BASE_URL is required in production")
-	}
-	if cfg.AppEnv == "production" && cfg.ManagedLLMModel == "" {
-		return Config{}, fmt.Errorf("PAPERLENS_LLM_MODEL is required in production")
-	}
+	// The managed LLM is intentionally optional during initial deployment. When
+	// it is absent, selectProvider returns UnconfiguredProvider and translation
+	// requests fail closed without sending document text anywhere.
 	if cfg.AppEnv == "production" && strings.TrimSpace(cfg.DatabaseURL) == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL is required in production")
 	}
@@ -101,6 +148,9 @@ func Load() (Config, error) {
 	}
 	if cfg.AppEnv == "production" && len(cfg.AdminUserIDs) == 0 {
 		return Config{}, fmt.Errorf("ADMIN_USER_IDS is required in production")
+	}
+	if cfg.AppEnv == "production" && len(cfg.DevTestUsers) > 0 {
+		return Config{}, fmt.Errorf("DEV_TEST_USERS must not be configured in production")
 	}
 	if cfg.AppEnv == "production" {
 		for name, value := range map[string]string{
@@ -134,6 +184,22 @@ func Load() (Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+func parseDevTestUsers(value string) []DevTestUser {
+	var users []DevTestUser
+	for _, item := range strings.Split(value, ",") {
+		parts := strings.SplitN(strings.TrimSpace(item), ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		id, label := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if id == "" || label == "" || len(id) > 128 || len(label) > 128 {
+			continue
+		}
+		users = append(users, DevTestUser{ID: id, Label: label})
+	}
+	return users
 }
 
 func requireHTTPSURL(name, value string) error {

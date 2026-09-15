@@ -16,6 +16,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/micanis/paperlens/backend/internal/account"
+	"github.com/micanis/paperlens/backend/internal/auth"
 	"github.com/micanis/paperlens/backend/internal/billing"
 	"github.com/micanis/paperlens/backend/internal/contract"
 	"github.com/micanis/paperlens/backend/internal/credits"
@@ -83,9 +84,10 @@ func (s *PostgresRatePolicyStore) Save(ctx context.Context, policy credits.RateP
 
 const schemaSQL = `
 create table if not exists schema_migrations (version integer primary key, applied_at timestamptz not null default now());
-create table if not exists users (id text primary key, email_hash text not null unique, created_at timestamptz not null default now(), status text not null default 'active', deletion_requested_at timestamptz, deletion_execute_at timestamptz);
+create table if not exists users (id text primary key, email_hash text not null unique, password_hash text, created_at timestamptz not null default now(), status text not null default 'active', deletion_requested_at timestamptz, deletion_execute_at timestamptz);
 alter table users add column if not exists deletion_requested_at timestamptz;
 alter table users add column if not exists deletion_execute_at timestamptz;
+alter table users add column if not exists password_hash text;
 create index if not exists users_deletion_execute_idx on users(deletion_execute_at) where deletion_execute_at is not null;
 create table if not exists subscriptions (id text primary key, user_id text not null references users(id), provider text not null, provider_customer_id text, provider_subscription_id text, plan_id text not null, status text not null, current_period_start timestamptz not null, current_period_end timestamptz not null, grace_until timestamptz, cancel_at_period_end boolean not null default false, last_event_at timestamptz, last_event_id text, pending_plan_id text, pending_plan_at timestamptz, created_at timestamptz not null default now(), updated_at timestamptz not null default now());
 alter table subscriptions add column if not exists grace_until timestamptz;
@@ -106,10 +108,14 @@ create index if not exists translation_requests_user_created_idx on translation_
 create table if not exists webhook_events (id text primary key, provider text not null, event_id text not null, event_type text not null, processing_at timestamptz, processed_at timestamptz, created_at timestamptz not null default now(), unique(provider, event_id));
 alter table webhook_events add column if not exists processing_at timestamptz;
 create table if not exists revoked_sessions (session_hash text primary key, expires_at timestamptz not null);
-create table if not exists auth_challenges (token_hash text primary key, kind text not null check (kind in ('oauth_state','magic_link')), user_id text, expires_at timestamptz not null, created_at timestamptz not null default now());
+create table if not exists auth_challenges (token_hash text primary key, kind text not null check (kind in ('oauth_state','magic_link')), provider text, user_id text, expires_at timestamptz not null, created_at timestamptz not null default now());
+alter table auth_challenges add column if not exists provider text;
 create index if not exists auth_challenges_expiry_idx on auth_challenges(expires_at);
+create table if not exists auth_identities (provider text not null, subject text not null, user_id text not null references users(id), created_at timestamptz not null default now(), primary key (provider, subject));
+create index if not exists auth_identities_user_idx on auth_identities(user_id);
+create unique index if not exists auth_identities_user_provider_idx on auth_identities(user_id, provider);
 create table if not exists rate_policies (id text primary key check (id='active'), version text not null, policy jsonb not null, updated_at timestamptz not null default now());
-insert into schema_migrations (version) values (1), (2), (3), (4), (5) on conflict (version) do nothing;
+insert into schema_migrations (version) values (1), (2), (3), (4), (5), (6) on conflict (version) do nothing;
 `
 
 // PostgresAccountStore implements the 24-hour deletion grace period. The
@@ -118,6 +124,22 @@ insert into schema_migrations (version) values (1), (2), (3), (4), (5) on confli
 type PostgresAccountStore struct{ db *sql.DB }
 
 func NewPostgresAccountStore(db *sql.DB) *PostgresAccountStore { return &PostgresAccountStore{db: db} }
+
+// Ensure creates an account for a newly authenticated OAuth identity while
+// keeping deleted accounts as non-revivable tombstones.
+func (s *PostgresAccountStore) Ensure(ctx context.Context, userID string) error {
+	if err := ensureUser(ctx, s.db, userID); err != nil {
+		return err
+	}
+	active, err := s.IsActive(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return account.ErrAlreadyDeleted
+	}
+	return nil
+}
 
 func (s *PostgresAccountStore) RequestDeletion(ctx context.Context, userID string, requestedAt, executeAt time.Time) (account.Deletion, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -210,7 +232,7 @@ func (s *PostgresAccountStore) ProcessDue(ctx context.Context, userID string, no
 	if err != nil {
 		return false, err
 	}
-	for _, table := range []string{"subscriptions", "credit_ledger", "translation_requests", "auth_challenges"} {
+	for _, table := range []string{"subscriptions", "credit_ledger", "translation_requests", "auth_challenges", "auth_identities"} {
 		if _, err := tx.ExecContext(ctx, `delete from `+table+` where user_id=$1`, userID); err != nil {
 			return false, err
 		}
@@ -482,6 +504,25 @@ type PostgresLoginStore struct{ db *sql.DB }
 
 func NewPostgresLoginStore(db *sql.DB) *PostgresLoginStore { return &PostgresLoginStore{db: db} }
 
+func (s *PostgresLoginStore) SaveOAuthStateBinding(hash string, state auth.OAuthState, expiresAt time.Time) error {
+	_, err := s.db.Exec(`insert into auth_challenges (token_hash,kind,provider,user_id,expires_at) values ($1,'oauth_state',$2,$3,$4) on conflict (token_hash) do update set kind=excluded.kind,provider=excluded.provider,user_id=excluded.user_id,expires_at=excluded.expires_at`, hash, state.Provider, nullableString(state.UserID), expiresAt)
+	return err
+}
+
+func (s *PostgresLoginStore) ConsumeOAuthStateBinding(hash string, now time.Time) (auth.OAuthState, bool, error) {
+	var state auth.OAuthState
+	var provider, userID sql.NullString
+	err := s.db.QueryRow(`delete from auth_challenges where token_hash=$1 and kind='oauth_state' and expires_at > $2 returning provider,user_id`, hash, now).Scan(&provider, &userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return auth.OAuthState{}, false, nil
+	}
+	if err != nil {
+		return auth.OAuthState{}, false, err
+	}
+	state.Provider, state.UserID = provider.String, userID.String
+	return state, true, nil
+}
+
 func (s *PostgresLoginStore) SaveOAuthState(hash string, expiresAt time.Time) error {
 	_, err := s.db.Exec(`insert into auth_challenges (token_hash,kind,expires_at) values ($1,'oauth_state',$2) on conflict (token_hash) do update set kind=excluded.kind,expires_at=excluded.expires_at`, hash, expiresAt)
 	return err
@@ -508,6 +549,153 @@ func (s *PostgresLoginStore) ConsumeMagicLink(hash string, now time.Time) (strin
 		return "", false, nil
 	}
 	return userID, err == nil, err
+}
+
+// PostgresCredentialStore stores local password credentials and the explicit
+// mapping from an OAuth provider subject to a PaperLens account.
+type PostgresCredentialStore struct{ db *sql.DB }
+
+func NewPostgresCredentialStore(db *sql.DB) *PostgresCredentialStore {
+	return &PostgresCredentialStore{db: db}
+}
+
+func (s *PostgresCredentialStore) CreatePasswordUser(ctx context.Context, emailHash, passwordHash string) (string, error) {
+	userID := randomID("password")
+	_, err := s.db.ExecContext(ctx, `insert into users (id,email_hash,password_hash) values ($1,$2,$3)`, userID, emailHash, passwordHash)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+		return "", auth.ErrEmailAlreadyRegistered
+	}
+	return userID, err
+}
+
+func (s *PostgresCredentialStore) PasswordCredential(ctx context.Context, emailHash string) (auth.PasswordCredential, error) {
+	var credential auth.PasswordCredential
+	var passwordHash sql.NullString
+	err := s.db.QueryRowContext(ctx, `select id,password_hash from users where email_hash=$1 and status='active'`, emailHash).Scan(&credential.UserID, &passwordHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return auth.PasswordCredential{}, auth.ErrInvalidCredentials
+		}
+		return auth.PasswordCredential{}, err
+	}
+	if !passwordHash.Valid || passwordHash.String == "" {
+		return auth.PasswordCredential{}, auth.ErrInvalidCredentials
+	}
+	credential.PasswordHash = passwordHash.String
+	return credential, nil
+}
+
+func (s *PostgresCredentialStore) FindOAuthUser(ctx context.Context, provider, subject string) (string, error) {
+	var userID string
+	err := s.db.QueryRowContext(ctx, `select i.user_id from auth_identities i join users u on u.id=i.user_id where i.provider=$1 and i.subject=$2 and u.status='active'`, provider, subject).Scan(&userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", auth.ErrIdentityNotFound
+	}
+	return userID, err
+}
+
+func (s *PostgresCredentialStore) CreateOAuthUser(ctx context.Context, profile auth.OAuthProfile, emailHash string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var existing string
+	if err := tx.QueryRowContext(ctx, `select user_id from auth_identities where provider=$1 and subject=$2`, profile.Provider, profile.Subject).Scan(&existing); err == nil {
+		if err := tx.Commit(); err != nil {
+			return "", err
+		}
+		return existing, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	userID := auth.StableUserID(profile.Provider, profile.Subject)
+	var userExists bool
+	if err := tx.QueryRowContext(ctx, `select true from users where id=$1`, userID).Scan(&userExists); errors.Is(err, sql.ErrNoRows) {
+		if _, err := tx.ExecContext(ctx, `insert into users (id,email_hash) values ($1,$2)`, userID, emailHash); err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+				return "", auth.ErrEmailAlreadyRegistered
+			}
+			return "", err
+		}
+	} else if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `insert into auth_identities (provider,subject,user_id) values ($1,$2,$3)`, profile.Provider, profile.Subject, userID); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+			return "", auth.ErrIdentityAlreadyLinked
+		}
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return userID, nil
+}
+
+func (s *PostgresCredentialStore) LinkOAuthIdentity(ctx context.Context, userID string, profile auth.OAuthProfile, emailHash string) error {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `select true from users where id=$1 and email_hash=$2 and status='active'`, userID, emailHash).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return auth.ErrInvalidCredentials
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `insert into auth_identities (provider,subject,user_id) values ($1,$2,$3)`, profile.Provider, profile.Subject, userID)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+		return auth.ErrIdentityAlreadyLinked
+	}
+	return err
+}
+
+func (s *PostgresCredentialStore) UnlinkOAuthIdentity(ctx context.Context, userID, provider string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var passwordHash sql.NullString
+	if err := tx.QueryRowContext(ctx, `select password_hash from users where id=$1 and status='active' for update`, userID).Scan(&passwordHash); errors.Is(err, sql.ErrNoRows) {
+		return auth.ErrInvalidCredentials
+	} else if err != nil {
+		return err
+	}
+	var identityCount int
+	if err := tx.QueryRowContext(ctx, `select count(*) from auth_identities where user_id=$1 and provider=$2`, userID, provider).Scan(&identityCount); err != nil {
+		return err
+	}
+	if identityCount == 0 {
+		return auth.ErrIdentityNotLinked
+	}
+	var totalCount int
+	if err := tx.QueryRowContext(ctx, `select count(*) from auth_identities where user_id=$1`, userID).Scan(&totalCount); err != nil {
+		return err
+	}
+	if !passwordHash.Valid && totalCount <= 1 {
+		return auth.ErrLastAuthMethod
+	}
+	if _, err := tx.ExecContext(ctx, `delete from auth_identities where user_id=$1 and provider=$2`, userID, provider); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresCredentialStore) ListOAuthIdentities(ctx context.Context, userID string) ([]auth.LinkedIdentity, error) {
+	rows, err := s.db.QueryContext(ctx, `select provider from auth_identities where user_id=$1 order by provider`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []auth.LinkedIdentity
+	for rows.Next() {
+		var provider string
+		if err := rows.Scan(&provider); err != nil {
+			return nil, err
+		}
+		result = append(result, auth.LinkedIdentity{Provider: provider})
+	}
+	return result, rows.Err()
 }
 
 // PostgresBillingStore persists only subscription identifiers and lifecycle

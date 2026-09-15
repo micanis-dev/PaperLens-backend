@@ -16,7 +16,7 @@
 
 ## バックアップと復元
 
-PostgreSQLは日次バックアップを取得し、APIと同じ東京リージョンを第一候補にします。保持先は本番DBとは別のアクセス境界に置き、復元テストを月次で行います。バックアップにはPDF本体・論文本文・BYOKキーは含まれません。
+Supabase FreeのPostgreSQLを利用する。Freeプランでは自動バックアップやPoint-in-Time Recoveryを前提にできないため、重要データを扱う段階ではバックアップ方式と有料プランへの移行を先に決める。保持先は本番DBとは別のアクセス境界に置き、復元テストを月次で行う。バックアップにはPDF本体・論文本文・BYOKキーは含まれない。
 
 1. デプロイ前にバックアップの成功時刻と復元可能性を確認する。
 2. 復元時は新しい一時DBへ復元し、`schema_migrations`、`subscriptions`、`credit_ledger`、`translation_requests`、`webhook_events`の件数と制約を確認する。
